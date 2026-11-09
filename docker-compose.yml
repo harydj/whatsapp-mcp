@@ -1,0 +1,18 @@
+services:
+  whatsapp-bridge:
+    build:
+      context: ./whatsapp-bridge
+      dockerfile: Dockerfile
+    container_name: whatsapp-bridge
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      WHATSAPP_DATABASE_URL: postgres://postgres:postgres@host.docker.internal:5432/whatsapp?sslmode=disable
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Media files only. Session + messages live in local Postgres.
+      - ./whatsapp-bridge/store:/app/store
+    stdin_open: true
+    tty: true

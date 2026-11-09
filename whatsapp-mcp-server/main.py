@@ -12,7 +12,9 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    request_history_sync as whatsapp_request_history_sync,
+    get_corrupted_group_message_count as whatsapp_get_corrupted_count,
 )
 
 # Initialize FastMCP server
@@ -20,10 +22,16 @@ mcp = FastMCP("whatsapp")
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
-    """Search WhatsApp contacts by name or phone number.
-    
+    """Find a WhatsApp contact in one call by name or phone number.
+
+    Matches first name, full name, push name, business name, and phone
+    (08..., 62..., +62, spaces or dashes, or the internal LID).
+    Each result includes phone_number, first_name, full_name, push_name,
+    lid, jid, and chat_jid. Use chat_jid for messages or sending.
+    A second lookup is only needed when several people share the name.
+
     Args:
-        query: Search term to match against contact names or phone numbers
+        query: Name fragment or phone number
     """
     contacts = whatsapp_search_contacts(query)
     return contacts
@@ -35,25 +43,38 @@ def list_messages(
     sender_phone_number: Optional[str] = None,
     chat_jid: Optional[str] = None,
     query: Optional[str] = None,
-    limit: int = 20,
+    limit: int = 30,
     page: int = 0,
-    include_context: bool = True,
+    include_context: bool = False,
     context_before: int = 1,
-    context_after: int = 1
-) -> List[Dict[str, Any]]:
-    """Get WhatsApp messages matching specified criteria with optional context.
-    
+    context_after: int = 1,
+    media_type: Optional[str] = None,
+    media_only: bool = False,
+) -> Dict[str, Any]:
+    """Search chat keywords and read older messages in one call.
+
+    chat_jid accepts a chat JID, a phone number (08... or 62...), or a
+    contact/group name. query matches every word against content OR filename.
+    Each message may include media_type, filename, file_length, has_media.
+    Media-only rows without caption show content like "[image] filename.jpg".
+    To open the file/image, call download_media(message_id, chat_jid) then Read the returned file_path.
+    The result includes messages, has_more, and next_before.
+    To read older history, call again with the same filters and before=next_before.
+    Do not walk history with page offsets.
+
     Args:
-        after: Optional ISO-8601 formatted string to only return messages after this date
-        before: Optional ISO-8601 formatted string to only return messages before this date
-        sender_phone_number: Optional phone number to filter messages by sender
-        chat_jid: Optional chat JID to filter messages by chat
-        query: Optional search term to filter messages by content
-        limit: Maximum number of messages to return (default 20)
-        page: Page number for pagination (default 0)
-        include_context: Whether to include messages before and after matches (default True)
-        context_before: Number of messages to include before each match (default 1)
-        context_after: Number of messages to include after each match (default 1)
+        after: Only messages after this ISO-8601 timestamp
+        before: Only messages before this ISO-8601 timestamp. Use next_before from the previous result.
+        sender_phone_number: Phone number, 08.../62... form, or LID
+        chat_jid: Chat JID, phone number, or contact/group name
+        query: Keyword or words to find in message text or filename
+        limit: Messages per page, 1 to 80 (default 30)
+        page: Offset page. Prefer before=next_before instead.
+        include_context: When true, keyword hits include neighboring lines in the same response
+        context_before: Lines before each hit when include_context is true
+        context_after: Lines after each hit when include_context is true
+        media_type: Optional filter: image, video, audio, document, or sticker
+        media_only: When true, return only messages that have media
     """
     messages = whatsapp_list_messages(
         after=after,
@@ -65,7 +86,9 @@ def list_messages(
         page=page,
         include_context=include_context,
         context_before=context_before,
-        context_after=context_after
+        context_after=context_after,
+        media_type=media_type,
+        media_only=media_only,
     )
     return messages
 
@@ -80,7 +103,7 @@ def list_chats(
     """Get WhatsApp chats matching specified criteria.
     
     Args:
-        query: Optional search term to filter chats by name or JID
+        query: Name, phone, or JID. Name search also uses the contact book, not only the chat title.
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
         include_last_message: Whether to include the last message in each chat (default True)
@@ -108,10 +131,13 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
 
 @mcp.tool()
 def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
-    """Get WhatsApp chat metadata by sender phone number.
-    
+    """Open one direct chat by phone number or contact name.
+
+    Resolves the phone or LID to the chat that stores the messages.
+    If the name matches several people, call search_contacts instead.
+
     Args:
-        sender_phone_number: The phone number to search for
+        sender_phone_number: Phone number (08... or 62...) or contact name
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
     return chat
@@ -223,28 +249,104 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
-    """Download media from a WhatsApp message and get the local file path.
-    
+    """Download media from a WhatsApp message to a host path Cursor can Read.
+
+    Use after list_messages shows has_media/media_type. Pass the message id and
+    chat_jid from that row. Returns a Windows host file_path under
+    whatsapp-bridge/store/ suitable for the Read tool (images/docs).
+
     Args:
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
     
     Returns:
-        A dictionary containing success status, a status message, and the file path if successful
+        success, message, file_path (host), filename, media_type
     """
-    file_path = whatsapp_download_media(message_id, chat_jid)
+    result = whatsapp_download_media(message_id, chat_jid)
     
-    if file_path:
+    if result and result.get("file_path"):
         return {
             "success": True,
             "message": "Media downloaded successfully",
-            "file_path": file_path
+            "file_path": result.get("file_path"),
+            "filename": result.get("filename"),
+            "media_type": result.get("media_type"),
+            "bridge_path": result.get("bridge_path"),
         }
     else:
         return {
             "success": False,
             "message": "Failed to download media"
         }
+
+
+@mcp.tool()
+def request_history_sync(
+    chat_jid: str,
+    anchor_message_id: Optional[str] = None,
+    count: int = 50
+) -> Dict[str, Any]:
+    """Request on-demand message history resync from WhatsApp primary device.
+    
+    Sends a request to your own phone asking for older messages in a chat.
+    This is useful to:
+    - Repair corrupted group message senders after the root fix is deployed
+    - Fetch older messages not in the initial sync
+    - Re-sync messages that may have been missed
+    
+    The response arrives asynchronously via the history sync handler.
+    
+    IMPORTANT: This sends a protocol message to YOUR OWN primary phone,
+    NOT to any contact or group. The phone will respond with ON_DEMAND
+    history sync data.
+    
+    Args:
+        chat_jid: The chat JID to resync (e.g., "120363429500369902@g.us" for group,
+                  "6281234567890@s.whatsapp.net" for direct chat)
+        anchor_message_id: Optional specific message ID to anchor from. If not provided,
+                          the system auto-selects the newest valid anchor. For groups,
+                          corrupted anchors (sender=group_id) are rejected.
+        count: Number of messages to request, bounded 1-50. Default 50.
+    
+    Returns:
+        Dict with success, message, request_accepted, chat_jid, anchor_message_id,
+        anchor_timestamp, count, and cooldown_seconds (if rate limited)
+    
+    Notes:
+        - Has a 30-second cooldown between requests
+        - For groups, only valid anchors are accepted
+        - Response arrives async; check messages later
+    """
+    result = whatsapp_request_history_sync(chat_jid, anchor_message_id, count)
+    
+    return {
+        "success": result.success,
+        "message": result.message,
+        "request_accepted": result.request_accepted,
+        "chat_jid": result.chat_jid,
+        "anchor_message_id": result.anchor_message_id,
+        "anchor_timestamp": result.anchor_timestamp,
+        "count": result.count,
+        "cooldown_seconds": result.cooldown_seconds
+    }
+
+
+@mcp.tool()
+def get_corrupted_group_message_count(chat_jid: str) -> Dict[str, Any]:
+    """Check how many messages in a group have corrupted sender (sender=group_id).
+    
+    This helps assess the extent of the history sync sender corruption bug
+    before and after running history resync repair.
+    
+    Args:
+        chat_jid: The group chat JID to check (e.g., "120363429500369902@g.us")
+    
+    Returns:
+        Dict with: chat_jid, is_group, total_messages, corrupted_count,
+        valid_count, from_me_count, corruption_percentage
+    """
+    return whatsapp_get_corrupted_count(chat_jid)
+
 
 if __name__ == "__main__":
     # Initialize and run the server

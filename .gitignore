@@ -1,3 +1,12 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+bridge-out.log
+bridge-err.log
+whatsapp-bridge/store/
+whatsapp-bridge/*.exe
+.gomodcache/
+backups/
+whatsapp-mcp-server/.venv/
+__pycache__/
+*.pyc

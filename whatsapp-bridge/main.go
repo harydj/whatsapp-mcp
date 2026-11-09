@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"context"
@@ -14,10 +14,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/lib/pq"
 	"github.com/mdp/qrterminal"
 
 	"bytes"
@@ -46,41 +47,72 @@ type MessageStore struct {
 	db *sql.DB
 }
 
+// HistorySyncTracker tracks on-demand history sync requests to prevent spam
+type HistorySyncTracker struct {
+	mu             sync.Mutex
+	lastRequest    time.Time
+	pendingRequest *HistorySyncRequest
+	cooldown       time.Duration
+}
+
+type HistorySyncRequest struct {
+	ChatJID         string
+	AnchorMessageID string
+	Count           int
+	RequestTime     time.Time
+}
+
+var historySyncTracker = &HistorySyncTracker{
+	cooldown: 30 * time.Second, // Minimum 30 seconds between requests
+}
+
+func databaseURL() string {
+	if v := os.Getenv("WHATSAPP_DATABASE_URL"); v != "" {
+		return v
+	}
+	return "postgres://postgres:postgres@127.0.0.1:5432/whatsapp?sslmode=disable"
+}
+
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
-	// Create directory for database if it doesn't exist
+	// Media files still live on disk under store/.
 	if err := os.MkdirAll("store", 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
-	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("postgres", databaseURL())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
+	db.SetMaxOpenConns(10)
+	db.SetConnMaxLifetime(30 * time.Minute)
 
-	// Create tables if they don't exist
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping message database: %v", err)
+	}
+
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMPTZ
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
 			sender TEXT,
 			content TEXT,
-			timestamp TIMESTAMP,
+			timestamp TIMESTAMPTZ,
 			is_from_me BOOLEAN,
 			media_type TEXT,
 			filename TEXT,
 			url TEXT,
-			media_key BLOB,
-			file_sha256 BLOB,
-			file_enc_sha256 BLOB,
-			file_length INTEGER,
+			media_key BYTEA,
+			file_sha256 BYTEA,
+			file_enc_sha256 BYTEA,
+			file_length BIGINT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -101,7 +133,8 @@ func (store *MessageStore) Close() error {
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES ($1, $2, $3)
+		ON CONFLICT (jid) DO UPDATE SET name = EXCLUDED.name, last_message_time = EXCLUDED.last_message_time`,
 		jid, name, lastMessageTime,
 	)
 	return err
@@ -116,9 +149,21 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		ON CONFLICT (id, chat_jid) DO UPDATE SET
+			sender = EXCLUDED.sender,
+			content = EXCLUDED.content,
+			timestamp = EXCLUDED.timestamp,
+			is_from_me = EXCLUDED.is_from_me,
+			media_type = EXCLUDED.media_type,
+			filename = EXCLUDED.filename,
+			url = EXCLUDED.url,
+			media_key = EXCLUDED.media_key,
+			file_sha256 = EXCLUDED.file_sha256,
+			file_enc_sha256 = EXCLUDED.file_enc_sha256,
+			file_length = EXCLUDED.file_length`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
@@ -127,7 +172,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		"SELECT COALESCE(sender,''), COALESCE(content,''), timestamp, COALESCE(is_from_me,false), COALESCE(media_type,''), COALESCE(filename,'') FROM messages WHERE chat_jid = $1 ORDER BY timestamp DESC LIMIT $2",
 		chatJID, limit,
 	)
 	if err != nil {
@@ -172,20 +217,136 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+// AnchorInfo contains information needed to build a history sync anchor
+type AnchorInfo struct {
+	ID        string
+	ChatJID   string
+	Sender    string
+	IsFromMe  bool
+	Timestamp time.Time
+}
+
+// GetValidAnchorForChat finds a suitable anchor message for history sync.
+// For group chats it prefers is_from_me messages, then messages with a valid participant sender.
+// It rejects rows whose sender equals the group JID user part (corrupted history rows).
+func (store *MessageStore) GetValidAnchorForChat(chatJID string, preferredAnchorID string) (*AnchorInfo, error) {
+	isGroup := strings.HasSuffix(chatJID, "@g.us")
+	groupUser := ""
+	if isGroup {
+		groupUser = strings.Split(chatJID, "@")[0]
+	}
+
+	if preferredAnchorID != "" {
+		row := store.db.QueryRow(`
+			SELECT id, chat_jid, COALESCE(sender,''), COALESCE(is_from_me,false), timestamp
+			FROM messages
+			WHERE chat_jid = $1 AND id = $2
+		`, chatJID, preferredAnchorID)
+
+		var anchor AnchorInfo
+		err := row.Scan(&anchor.ID, &anchor.ChatJID, &anchor.Sender, &anchor.IsFromMe, &anchor.Timestamp)
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("anchor message %s not found in chat %s", preferredAnchorID, chatJID)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to query anchor: %v", err)
+		}
+		if isGroup && !anchor.IsFromMe && (anchor.Sender == groupUser || anchor.Sender == "") {
+			return nil, fmt.Errorf("anchor message %s has corrupted sender (group ID); use a self-message or valid participant message", preferredAnchorID)
+		}
+		return &anchor, nil
+	}
+
+	var row *sql.Row
+	if isGroup {
+		row = store.db.QueryRow(`
+			SELECT id, chat_jid, COALESCE(sender,''), COALESCE(is_from_me,false), timestamp
+			FROM messages
+			WHERE chat_jid = $1
+			AND timestamp IS NOT NULL
+			AND (is_from_me = true OR (COALESCE(sender,'') <> $2 AND COALESCE(sender,'') <> ''))
+			ORDER BY is_from_me DESC, timestamp DESC
+			LIMIT 1
+		`, chatJID, groupUser)
+	} else {
+		row = store.db.QueryRow(`
+			SELECT id, chat_jid, COALESCE(sender,''), COALESCE(is_from_me,false), timestamp
+			FROM messages
+			WHERE chat_jid = $1 AND timestamp IS NOT NULL
+			ORDER BY timestamp DESC
+			LIMIT 1
+		`, chatJID)
+	}
+
+	var anchor AnchorInfo
+	err := row.Scan(&anchor.ID, &anchor.ChatJID, &anchor.Sender, &anchor.IsFromMe, &anchor.Timestamp)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("no valid anchor message found in chat %s", chatJID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query anchor: %v", err)
+	}
+	return &anchor, nil
+}
+
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
 		return ""
 	}
 
-	// Try to get text content
+	// Plain / extended text
 	if text := msg.GetConversation(); text != "" {
 		return text
-	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
+	}
+	if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Captions on media (previously dropped → empty content for all images/docs)
+	if img := msg.GetImageMessage(); img != nil {
+		if cap := img.GetCaption(); cap != "" {
+			return cap
+		}
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		if cap := vid.GetCaption(); cap != "" {
+			return cap
+		}
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		if cap := doc.GetCaption(); cap != "" {
+			return cap
+		}
+	}
+	if wrapped := msg.GetDocumentWithCaptionMessage(); wrapped != nil {
+		if inner := wrapped.GetMessage(); inner != nil {
+			if doc := inner.GetDocumentMessage(); doc != nil {
+				if cap := doc.GetCaption(); cap != "" {
+					return cap
+				}
+			}
+			if text := extractTextContent(inner); text != "" {
+				return text
+			}
+		}
+	}
+	if ephem := msg.GetEphemeralMessage(); ephem != nil {
+		if inner := ephem.GetMessage(); inner != nil {
+			return extractTextContent(inner)
+		}
+	}
+	if viewOnce := msg.GetViewOnceMessage(); viewOnce != nil {
+		if inner := viewOnce.GetMessage(); inner != nil {
+			return extractTextContent(inner)
+		}
+	}
+	if viewOnceV2 := msg.GetViewOnceMessageV2(); viewOnceV2 != nil {
+		if inner := viewOnceV2.GetMessage(); inner != nil {
+			return extractTextContent(inner)
+		}
+	}
+
 	return ""
 }
 
@@ -377,32 +538,71 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 		return "", "", "", nil, nil, nil, 0
 	}
 
+	// Unwrap common containers first
+	if ephem := msg.GetEphemeralMessage(); ephem != nil {
+		if inner := ephem.GetMessage(); inner != nil {
+			return extractMediaInfo(inner)
+		}
+	}
+	if viewOnce := msg.GetViewOnceMessage(); viewOnce != nil {
+		if inner := viewOnce.GetMessage(); inner != nil {
+			return extractMediaInfo(inner)
+		}
+	}
+	if viewOnceV2 := msg.GetViewOnceMessageV2(); viewOnceV2 != nil {
+		if inner := viewOnceV2.GetMessage(); inner != nil {
+			return extractMediaInfo(inner)
+		}
+	}
+	if wrapped := msg.GetDocumentWithCaptionMessage(); wrapped != nil {
+		if inner := wrapped.GetMessage(); inner != nil {
+			return extractMediaInfo(inner)
+		}
+	}
+
+	stamp := time.Now().Format("20060102_150405")
+
+	// Prefer CDN URL (keeps signed oh/oe query). Bare DirectPath without
+	// query makes whatsmeow build an unsigned CDN request → HTTP 403.
+	pickLocator := func(directPath, cdnURL string) string {
+		if cdnURL != "" {
+			return cdnURL
+		}
+		return directPath
+	}
+
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
-			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
+		return "image", "image_" + stamp + ".jpg",
+			pickLocator(img.GetDirectPath(), img.GetURL()), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
-			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
+		return "video", "video_" + stamp + ".mp4",
+			pickLocator(vid.GetDirectPath(), vid.GetURL()), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
-			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
+		return "audio", "audio_" + stamp + ".ogg",
+			pickLocator(aud.GetDirectPath(), aud.GetURL()), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
+	}
+
+	// Check for sticker message
+	if st := msg.GetStickerMessage(); st != nil {
+		return "sticker", "sticker_" + stamp + ".webp",
+			pickLocator(st.GetDirectPath(), st.GetURL()), st.GetMediaKey(), st.GetFileSHA256(), st.GetFileEncSHA256(), st.GetFileLength()
 	}
 
 	// Check for document message
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
 		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
+			filename = "document_" + stamp
 		}
 		return "document", filename,
-			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
+			pickLocator(doc.GetDirectPath(), doc.GetURL()), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
 	}
 
 	return "", "", "", nil, nil, nil, 0
@@ -434,6 +634,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
+	// Keep filenames unique per message so downloads do not overwrite
+	if mediaType != "" && filename != "" && !strings.HasPrefix(filename, msg.Info.ID+"_") {
+		filename = msg.Info.ID + "_" + filename
+	}
+
 	// Store message in database
 	err = messageStore.StoreMessage(
 		msg.Info.ID,
@@ -456,9 +661,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	} else {
 		// Log message reception
 		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
-		direction := "←"
+		direction := "â†"
 		if msg.Info.IsFromMe {
-			direction = "→"
+			direction = "â†’"
 		}
 
 		// Log based on message type
@@ -478,16 +683,17 @@ type DownloadMediaRequest struct {
 
 // DownloadMediaResponse represents the response for the download media API
 type DownloadMediaResponse struct {
-	Success  bool   `json:"success"`
-	Message  string `json:"message"`
-	Filename string `json:"filename,omitempty"`
-	Path     string `json:"path,omitempty"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	Filename  string `json:"filename,omitempty"`
+	Path      string `json:"path,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
 }
 
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
-		"UPDATE messages SET url = ?, media_key = ?, file_sha256 = ?, file_enc_sha256 = ?, file_length = ? WHERE id = ? AND chat_jid = ?",
+		"UPDATE messages SET url = $1, media_key = $2, file_sha256 = $3, file_enc_sha256 = $4, file_length = $5 WHERE id = $6 AND chat_jid = $7",
 		url, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID,
 	)
 	return err
@@ -500,7 +706,7 @@ func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, str
 	var fileLength uint64
 
 	err := store.db.QueryRow(
-		"SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?",
+		"SELECT COALESCE(media_type,''), COALESCE(filename,''), COALESCE(url,''), media_key, file_sha256, file_enc_sha256, COALESCE(file_length,0) FROM messages WHERE id = $1 AND chat_jid = $2",
 		id, chatJID,
 	).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
 
@@ -571,7 +777,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	if err != nil {
 		// Try to get basic info if extended info isn't available
 		err = messageStore.db.QueryRow(
-			"SELECT media_type, filename FROM messages WHERE id = ? AND chat_jid = ?",
+			"SELECT COALESCE(media_type,''), COALESCE(filename,'') FROM messages WHERE id = $1 AND chat_jid = $2",
 			messageID, chatJID,
 		).Scan(&mediaType, &filename)
 
@@ -607,13 +813,20 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	// If we don't have all the media info we need, we can't download
 	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
-		return false, "", "", "", fmt.Errorf("incomplete media information for download")
+		return false, "", "", "", fmt.Errorf("incomplete media information for download (need locator+keys+length)")
 	}
 
 	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
 
-	// Extract direct path from URL
+	// whatsmeow rebuilds https://<media-host><directPath>&hash=...&mms-type=...
+	// so directPath MUST keep the signed query (?ccb=&oh=&oe=...).
 	directPath := extractDirectPathFromURL(url)
+	if directPath == "" {
+		return false, "", "", "", fmt.Errorf("could not derive media direct path from stored locator")
+	}
+	if !strings.Contains(directPath, "?") {
+		fmt.Printf("Warning: media locator for %s has no signed query; CDN may return 403\n", messageID)
+	}
 
 	// Create a downloader that implements DownloadableMessage
 	var waMediaType whatsmeow.MediaType
@@ -626,11 +839,13 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		waMediaType = whatsmeow.MediaAudio
 	case "document":
 		waMediaType = whatsmeow.MediaDocument
+	case "sticker":
+		waMediaType = whatsmeow.MediaImage
 	default:
 		return false, "", "", "", fmt.Errorf("unsupported media type: %s", mediaType)
 	}
 
-	downloader := &MediaDownloader{
+	dl := &MediaDownloader{
 		URL:           url,
 		DirectPath:    directPath,
 		MediaKey:      mediaKey,
@@ -639,10 +854,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		FileEncSHA256: fileEncSHA256,
 		MediaType:     waMediaType,
 	}
-
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
-	if err != nil {
+	mediaData, err := client.Download(context.Background(), dl)
+	if err != nil || mediaData == nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
 
@@ -655,28 +868,176 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	return true, mediaType, filename, absPath, nil
 }
 
-// Extract direct path from a WhatsApp media URL
+// Extract direct path from a WhatsApp media URL.
+// Keep the signed query string (ccb/oh/oe/_nc_sid/mms3). whatsmeow appends
+// &hash=... with an ampersand, so stripping "?" yields unsigned 403s.
 func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
+	if url == "" {
+		return ""
+	}
+	u := strings.TrimSpace(url)
+	// Already a path (optionally signed)
+	if strings.HasPrefix(u, "/") {
+		u = strings.SplitN(u, "#", 2)[0]
+		return u
+	}
+	if idx := strings.Index(u, "://"); idx >= 0 {
+		u = u[idx+3:]
+	}
+	// Drop host, keep /path?query
+	if idx := strings.Index(u, "/"); idx >= 0 {
+		u = u[idx:]
+	} else {
+		return ""
+	}
+	u = strings.SplitN(u, "#", 2)[0]
+	if !strings.HasPrefix(u, "/") {
+		u = "/" + u
+	}
+	return u
+}
 
-	// Find the path part after the domain
-	parts := strings.SplitN(url, ".net/", 2)
-	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+// HistorySyncRequest API types
+type HistorySyncAPIRequest struct {
+	ChatJID         string `json:"chat_jid"`
+	AnchorMessageID string `json:"anchor_message_id,omitempty"` // Optional - will auto-select if not provided
+	Count           int    `json:"count"`
+}
+
+type HistorySyncAPIResponse struct {
+	Success         bool   `json:"success"`
+	Message         string `json:"message"`
+	RequestAccepted bool   `json:"request_accepted,omitempty"`
+	ChatJID         string `json:"chat_jid,omitempty"`
+	AnchorMessageID string `json:"anchor_message_id,omitempty"`
+	AnchorTimestamp string `json:"anchor_timestamp,omitempty"`
+	Count           int    `json:"count,omitempty"`
+	CooldownSeconds int    `json:"cooldown_seconds,omitempty"`
+}
+
+// RequestOnDemandHistorySync sends an on-demand history sync request via SendPeerMessage.
+// This sends to the user's own primary device, NOT to any contact/group/status.
+func RequestOnDemandHistorySync(client *whatsmeow.Client, messageStore *MessageStore, chatJID string, anchorMessageID string, count int, logger waLog.Logger) (*HistorySyncAPIResponse, error) {
+	// Validate client state
+	if !client.IsConnected() {
+		return nil, fmt.Errorf("not connected to WhatsApp")
 	}
 
-	pathPart := parts[1]
+	if client.Store.ID == nil {
+		return nil, fmt.Errorf("not logged in")
+	}
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
+	// Validate count bounds (1-50)
+	if count < 1 {
+		count = 1
+	}
+	if count > 50 {
+		count = 50
+	}
 
-	// Create proper direct path format
-	return "/" + pathPart
+	// Parse and validate chat JID
+	parsedChatJID, err := types.ParseJID(chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid chat_jid: %v", err)
+	}
+
+	// Verify chat exists in our database
+	var chatExists int
+	err = messageStore.db.QueryRow("SELECT 1 FROM chats WHERE jid = $1", chatJID).Scan(&chatExists)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("chat %s not found in local database", chatJID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify chat: %v", err)
+	}
+
+	// Check cooldown
+	historySyncTracker.mu.Lock()
+	timeSinceLastRequest := time.Since(historySyncTracker.lastRequest)
+	if timeSinceLastRequest < historySyncTracker.cooldown {
+		remainingCooldown := historySyncTracker.cooldown - timeSinceLastRequest
+		historySyncTracker.mu.Unlock()
+		return &HistorySyncAPIResponse{
+			Success:         false,
+			Message:         fmt.Sprintf("Please wait %d seconds before making another history sync request", int(remainingCooldown.Seconds())+1),
+			CooldownSeconds: int(remainingCooldown.Seconds()) + 1,
+		}, nil
+	}
+	historySyncTracker.mu.Unlock()
+
+	// Get valid anchor from database
+	anchor, err := messageStore.GetValidAnchorForChat(chatJID, anchorMessageID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find valid anchor: %v", err)
+	}
+
+	// Build the MessageInfo for the anchor
+	var senderJID types.JID
+	if anchor.IsFromMe {
+		senderJID = client.Store.ID.ToNonAD()
+	} else {
+		// Parse sender - could be phone@s.whatsapp.net or lid@lid
+		if strings.Contains(anchor.Sender, "@") {
+			senderJID, err = types.ParseJID(anchor.Sender)
+		} else {
+			// Assume phone number
+			senderJID = types.JID{User: anchor.Sender, Server: types.DefaultUserServer}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse sender JID: %v", err)
+		}
+	}
+
+	anchorInfo := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     parsedChatJID,
+			Sender:   senderJID,
+			IsFromMe: anchor.IsFromMe,
+			IsGroup:  strings.HasSuffix(chatJID, "@g.us"),
+		},
+		ID:        anchor.ID,
+		Timestamp: anchor.Timestamp,
+	}
+
+	// Build the history sync request message
+	historyMsg := client.BuildHistorySyncRequest(anchorInfo, count)
+	if historyMsg == nil {
+		return nil, fmt.Errorf("failed to build history sync request")
+	}
+
+	// Send via SendPeerMessage - this goes to user's primary device, not any contact
+	logger.Infof("Sending on-demand history sync request for chat %s, anchor %s, count %d", chatJID, anchor.ID, count)
+	_, err = client.SendPeerMessage(context.Background(), historyMsg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send history sync request: %v", err)
+	}
+
+	// Update cooldown tracker
+	historySyncTracker.mu.Lock()
+	historySyncTracker.lastRequest = time.Now()
+	historySyncTracker.pendingRequest = &HistorySyncRequest{
+		ChatJID:         chatJID,
+		AnchorMessageID: anchor.ID,
+		Count:           count,
+		RequestTime:     time.Now(),
+	}
+	historySyncTracker.mu.Unlock()
+
+	logger.Infof("On-demand history sync request sent successfully")
+
+	return &HistorySyncAPIResponse{
+		Success:         true,
+		Message:         "History sync request sent to primary device. Response will arrive as ON_DEMAND history sync event.",
+		RequestAccepted: true,
+		ChatJID:         chatJID,
+		AnchorMessageID: anchor.ID,
+		AnchorTimestamp: anchor.Timestamp.Format(time.RFC3339),
+		Count:           count,
+	}, nil
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, logger waLog.Logger) {
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -765,13 +1126,76 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		// Prefer container mount path so MCP can map to the Windows host store.
+		respPath := path
+		if idx := strings.Index(strings.ReplaceAll(path, "\\", "/"), "/store/"); idx >= 0 {
+			respPath = "/app" + strings.ReplaceAll(path, "\\", "/")[idx:]
+		}
+
 		// Send successful response
 		json.NewEncoder(w).Encode(DownloadMediaResponse{
-			Success:  true,
-			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
-			Filename: filename,
-			Path:     path,
+			Success:   true,
+			Message:   fmt.Sprintf("Successfully downloaded %s media", mediaType),
+			Filename:  filename,
+			Path:      respPath,
+			MediaType: mediaType,
 		})
+	})
+
+	http.HandleFunc("/api/history-sync", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req HistorySyncAPIRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(HistorySyncAPIResponse{
+				Success: false,
+				Message: "Invalid request format",
+			})
+			return
+		}
+
+		// Validate required fields
+		if req.ChatJID == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(HistorySyncAPIResponse{
+				Success: false,
+				Message: "chat_jid is required",
+			})
+			return
+		}
+
+		// Default count to 50 if not specified
+		if req.Count == 0 {
+			req.Count = 50
+		}
+
+		// Execute the history sync request
+		response, err := RequestOnDemandHistorySync(client, messageStore, req.ChatJID, req.AnchorMessageID, req.Count, logger)
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(HistorySyncAPIResponse{
+				Success: false,
+				Message: err.Error(),
+			})
+			return
+		}
+
+		if !response.Success {
+			w.WriteHeader(http.StatusTooManyRequests)
+		}
+
+		json.NewEncoder(w).Encode(response)
 	})
 
 	// Start the server
@@ -791,23 +1215,23 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
-	// Create database connection for storing session data
+	// Session store lives in local Postgres (same database as messages).
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
-	// Create directory for database if it doesn't exist
 	if err := os.MkdirAll("store", 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	logger.Infof("Using Postgres for WhatsApp session and messages")
+	container, err := sqlstore.New(context.Background(), "postgres", databaseURL(), dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -903,10 +1327,10 @@ func main() {
 		return
 	}
 
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+	fmt.Println("\nâœ“ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, 8080, logger)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -926,7 +1350,7 @@ func main() {
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
 	var existingName string
-	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
+	err := messageStore.db.QueryRow("SELECT COALESCE(name,'') FROM chats WHERE jid = $1", chatJID).Scan(&existingName)
 	if err == nil && existingName != "" {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
@@ -973,7 +1397,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1412,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1005,11 +1429,20 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	return name
 }
 
-// Handle history sync events
+// Handle history sync events using ParseWebMessage for correct sender extraction.
+// This handles both initial sync and ON_DEMAND responses.
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	syncType := "UNKNOWN"
+	if historySync.Data.SyncType != nil {
+		syncType = historySync.Data.SyncType.String()
+	}
+
+	fmt.Printf("Received history sync event (type: %s) with %d conversations\n", syncType, len(historySync.Data.Conversations))
 
 	syncedCount := 0
+	skippedNoSender := 0
+	repairedCount := 0
+
 	for _, conversation := range historySync.Data.Conversations {
 		// Parse JID from the conversation
 		if conversation.ID == nil {
@@ -1047,78 +1480,69 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 			messageStore.StoreChat(chatJID, name, timestamp)
 
-			// Store messages
+			// Store messages using ParseWebMessage for correct sender extraction
 			for _, msg := range messages {
 				if msg == nil || msg.Message == nil {
 					continue
 				}
 
-				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
+				// Use ParseWebMessage - the library-supported way to extract sender
+				evt, err := client.ParseWebMessage(jid, msg.Message)
+				if err != nil {
+					// ParseWebMessage returns an error if sender cannot be determined
+					if jid.Server == types.GroupServer {
+						skippedNoSender++
+						logger.Warnf("Skipping group message %s: %v (participant info unavailable)",
+							msg.Message.GetKey().GetID(), err)
+					} else {
+						logger.Warnf("Failed to parse message %s: %v", msg.Message.GetKey().GetID(), err)
 					}
+					continue
 				}
+
+				// Extract text content
+				content := extractTextContent(evt.RawMessage)
 
 				// Extract media info
-				var mediaType, filename, url string
-				var mediaKey, fileSHA256, fileEncSHA256 []byte
-				var fileLength uint64
-
-				if msg.Message.Message != nil {
-					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
-				}
-
-				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+				mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(evt.RawMessage)
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
 					continue
 				}
 
-				// Determine sender
-				var sender string
-				isFromMe := false
-				if msg.Message.Key != nil {
-					if msg.Message.Key.FromMe != nil {
-						isFromMe = *msg.Message.Key.FromMe
-					}
-					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
-					} else if isFromMe {
-						sender = client.Store.ID.User
-					} else {
-						sender = jid.User
-					}
-				} else {
-					sender = jid.User
-				}
+				// Get sender from the parsed event - this is the CORRECT sender
+				sender := evt.Info.Sender.User
 
-				// Store message
-				msgID := ""
-				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
-					msgID = *msg.Message.Key.ID
-				}
+				// Check if this message already exists with corrupted sender
+				var existingSender string
+				err = messageStore.db.QueryRow(
+					"SELECT COALESCE(sender,'') FROM messages WHERE id = $1 AND chat_jid = $2",
+					evt.Info.ID, chatJID,
+				).Scan(&existingSender)
 
-				// Get message timestamp
-				timestamp := time.Time{}
-				if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
-					timestamp = time.Unix(int64(ts), 0)
-				} else {
-					continue
+				isRepair := false
+				if err == nil {
+					// Message exists - check if this is a repair
+					isGroup := jid.Server == types.GroupServer
+					groupUser := ""
+					if isGroup {
+						groupUser = jid.User
+					}
+					if isGroup && existingSender == groupUser && sender != groupUser {
+						// This is a repair - old sender was corrupted, new sender is valid
+						isRepair = true
+						logger.Infof("Repairing message %s sender: %s -> %s", evt.Info.ID, existingSender, sender)
+					}
 				}
 
 				err = messageStore.StoreMessage(
-					msgID,
+					evt.Info.ID,
 					chatJID,
 					sender,
 					content,
-					timestamp,
-					isFromMe,
+					evt.Info.Timestamp,
+					evt.Info.IsFromMe,
 					mediaType,
 					filename,
 					url,
@@ -1131,20 +1555,37 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
+					if isRepair {
+						repairedCount++
+					}
 					// Log successful message storage
 					if mediaType != "" {
 						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
+							evt.Info.Timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
 					} else {
 						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
+							evt.Info.Timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
 					}
 				}
 			}
 		}
 	}
 
-	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	fmt.Printf("History sync complete (type: %s). Stored %d messages", syncType, syncedCount)
+	if repairedCount > 0 {
+		fmt.Printf(", repaired %d corrupted sender(s)", repairedCount)
+	}
+	if skippedNoSender > 0 {
+		fmt.Printf(", skipped %d group messages without participant info", skippedNoSender)
+	}
+	fmt.Println(".")
+
+	// Clear pending request if this was an ON_DEMAND response
+	if syncType == "ON_DEMAND" {
+		historySyncTracker.mu.Lock()
+		historySyncTracker.pendingRequest = nil
+		historySyncTracker.mu.Unlock()
+	}
 }
 
 // Request history sync from the server
